@@ -1,4 +1,13 @@
-import { getModelById, getVideoModelById, getI2IModelById, getI2VModelById, getV2VModelById, getLipSyncModelById } from './models.js';
+import { getModelById, getVideoModelById, getI2IModelById, getI2VModelById, getV2VModelById, getRecastModelById, getLipSyncModelById, getAudioModelById } from './models.js';
+import {
+    buildVideoToolPayload,
+    serializeVideoToolOptions,
+} from './videoToolCapabilities.js';
+import { buildImageSizePayload } from './imageSizing.js';
+import { buildImageInputPayload, getImageInputValidationError, normalizePrimaryImageUrls } from './imageInputContracts.js';
+import { pollForGenerationResult } from './utils/generationLifecycle.js';
+import { mapReferenceParams } from './modelCapabilities.js';
+import { buildSupplementalInputPayload } from './modelParameters.js';
 
 // In an http(s) browser we route through the host app's proxy (Next.js routes
 // under /api/* re-issue the call server-side) so api.muapi.ai CORS is bypassed.
@@ -7,29 +16,48 @@ const BASE_URL = (typeof window !== 'undefined' && window.location?.protocol?.st
     ? '/api'
     : 'https://api.muapi.ai';
 const PROXY_WF_BASE = '/api/workflow';
+const FILE_UPLOAD_TIMEOUT_MS = 300_000;
+const FILE_UPLOAD_PENDING_PROGRESS = 99;
+
+function notifyAuthRequired(status, detail) {
+    if (typeof window === 'undefined') return;
+    if (status !== 401 && status !== 403) return;
+    window.dispatchEvent(new CustomEvent('muapi:auth-required', { detail: { status, message: detail } }));
+}
+
+function assertRequiredPrompt(model, params) {
+    if (model?.promptRequired && !String(params.prompt || '').trim()) {
+        throw new Error('Prompt is required for this model.');
+    }
+}
+
+function includeRequiredArrayDefaults(model, payload) {
+    const defaults = {};
+    for (const field of model?.required || []) {
+        if (payload[field] !== undefined || model?.inputs?.[field]?.type !== 'array') continue;
+        defaults[field] = [];
+    }
+    return Object.keys(defaults).length > 0 ? { ...defaults, ...payload } : payload;
+}
 
 async function pollForResult(requestId, key, maxAttempts = 900, interval = 2000) {
-    const pollUrl = `${BASE_URL}/api/v1/predictions/${requestId}/result`;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        await new Promise(resolve => setTimeout(resolve, interval));
-        try {
-            const response = await fetch(pollUrl, {
-                headers: { 'Content-Type': 'application/json', 'x-api-key': key }
-            });
-            if (!response.ok) {
-                const errText = await response.text();
-                if (response.status >= 500) continue;
-                throw new Error(`Poll Failed: ${response.status} - ${errText.slice(0, 100)}`);
-            }
-            const data = await response.json();
-            const status = data.status?.toLowerCase();
-            if (status === 'completed' || status === 'succeeded' || status === 'success') return data;
-            if (status === 'failed' || status === 'error') throw new Error(`Generation failed: ${data.error || 'Unknown error'}`);
-        } catch (error) {
-            if (attempt === maxAttempts) throw error;
-        }
-    }
-    throw new Error('Generation timed out after polling.');
+    return pollForGenerationResult({
+        baseUrl: BASE_URL,
+        requestId,
+        apiKey: key,
+        maxAttempts,
+        interval,
+        onAuthRequired: notifyAuthRequired,
+    });
+}
+
+function normalizePredictionResult(submitData, result, outputUrl) {
+    const requestId = submitData?.request_id || submitData?.id || result?.request_id || result?.id;
+    return {
+        ...result,
+        ...(requestId ? { request_id: requestId } : {}),
+        url: outputUrl,
+    };
 }
 
 async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 60) {
@@ -41,6 +69,7 @@ async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 
     });
     if (!response.ok) {
         const errText = await response.text();
+        notifyAuthRequired(response.status, errText);
         throw new Error(`API Request Failed: ${response.status} ${response.statusText} - ${errText.slice(0, 100)}`);
     }
     const submitData = await response.json();
@@ -49,14 +78,18 @@ async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 
     if (onRequestId) onRequestId(requestId);
     const result = await pollForResult(requestId, key, maxAttempts);
     const outputUrl = result.outputs?.[0] || result.url || result.output?.url;
-    return { ...result, url: outputUrl };
+    return normalizePredictionResult(submitData, result, outputUrl);
 }
 
 export async function generateImage(apiKey, params) {
     const modelInfo = getModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = { prompt: params.prompt };
-    if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
+    const payload = {
+        ...buildSupplementalInputPayload(modelInfo, params),
+        prompt: params.prompt
+    };
+    if (modelInfo) Object.assign(payload, buildImageSizePayload(modelInfo, params.aspect_ratio));
+    else if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
     if (params.image_url) { 
@@ -74,15 +107,25 @@ export async function generateImage(apiKey, params) {
 export async function generateI2I(apiKey, params) {
     const modelInfo = getI2IModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = {};
-    if (params.prompt) payload.prompt = params.prompt;
     const imageField = modelInfo?.imageField || 'image_url';
-    const imagesList = params.images_list?.length > 0 ? params.images_list : (params.image_url ? [params.image_url] : null);
-    if (imagesList) {
+    const imagesList = normalizePrimaryImageUrls(params.images_list, params.image_url);
+    const inputError = getImageInputValidationError(modelInfo, 'i2i', {
+        prompt: params.prompt,
+        primaryImageUrls: imagesList,
+        auxiliaryImageUrls: params,
+    });
+    if (inputError) throw new Error(inputError);
+    const payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params),
+        ...buildImageInputPayload(modelInfo, 'i2i', params)
+    };
+    if (imagesList.length > 0) {
         if (imageField === 'images_list') payload.images_list = imagesList;
         else payload[imageField] = imagesList[0];
     }
-    if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
+    if (modelInfo) Object.assign(payload, buildImageSizePayload(modelInfo, params.aspect_ratio));
+    else if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
     if (modelInfo?.inputs?.name) {
@@ -91,34 +134,53 @@ export async function generateI2I(apiKey, params) {
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 60);
 }
 
+export async function decomposeLayers(apiKey, params) {
+    const endpoint = 'bytedance-seedream-5.0-pro-layer';
+    const payload = {
+        image_url: params.image_url,
+        prompt: params.prompt || '',
+        resolution: params.resolution || 'auto',
+        output_format: params.output_format || 'png'
+    };
+    const result = await submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 300);
+    const rawImages = result.images || result.output?.images || result.outputs || (result.url ? [result.url] : []);
+    const images = Array.isArray(rawImages) ? rawImages : [rawImages];
+    return { ...result, images };
+}
+
 export async function generateVideo(apiKey, params) {
     const modelInfo = getVideoModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = {};
+    assertRequiredPrompt(modelInfo, params);
+    let payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params)
+    };
     if (params.prompt) payload.prompt = params.prompt;
+    if (params.request_id) payload.request_id = params.request_id;
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.duration) payload.duration = params.duration;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
     if (params.mode) payload.mode = params.mode;
     if (params.image_url) payload.image_url = params.image_url;
+    if (params.images_list?.length > 0) payload.images_list = params.images_list;
+    if (params.videos_list?.length > 0) payload.videos_list = params.videos_list;
+    if (params.video_files?.length > 0) payload.video_files = params.video_files;
+    Object.assign(payload, serializeVideoToolOptions(modelInfo, params.options));
+    payload = includeRequiredArrayDefaults(modelInfo, payload);
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
 }
 
 export async function generateI2V(apiKey, params) {
     const modelInfo = getI2VModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = {};
+    assertRequiredPrompt(modelInfo, params);
+    let payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params)
+    };
     if (params.prompt) payload.prompt = params.prompt;
-    const imageField = modelInfo?.imageField || 'image_url';
-    if (params.image_url) {
-        if (imageField === 'images_list') payload.images_list = [params.image_url];
-        else payload[imageField] = params.image_url;
-    }
-    const lastImageField = modelInfo?.lastImageField;
-    if (lastImageField && params.last_image) {
-        payload[lastImageField] = params.last_image;
-    }
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.duration) payload.duration = params.duration;
     if (params.resolution) payload.resolution = params.resolution;
@@ -127,6 +189,7 @@ export async function generateI2V(apiKey, params) {
     if (modelInfo?.inputs?.name) {
         payload.name = params.name || modelInfo.inputs.name.default;
     }
+    payload = includeRequiredArrayDefaults(modelInfo, payload);
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
 }
 
@@ -145,6 +208,62 @@ export async function generateMarketingStudioAd(apiKey, params) {
 export async function processV2V(apiKey, params) {
     const modelInfo = getV2VModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
+    const toolPayload = buildVideoToolPayload(modelInfo, params);
+    let payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params),
+        ...toolPayload,
+    };
+    if (modelInfo?.hasPrompt && params.prompt) {
+        payload.prompt = params.prompt;
+    }
+    payload = includeRequiredArrayDefaults(modelInfo, payload);
+    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+}
+
+export async function estimateV2VCost(params, signal) {
+    const modelInfo = getV2VModelById(params?.model);
+    const endpoint = modelInfo?.endpoint || params?.model;
+    if (!endpoint) {
+        throw new Error('A V2V model is required to estimate cost.');
+    }
+
+    const payload = buildVideoToolPayload(modelInfo, params);
+    const response = await fetch(`${BASE_URL}/api/v1/models/${endpoint}/estimate-cost`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Cost estimate failed: ${response.status} ${response.statusText} - ${errText.slice(0, 100)}`);
+    }
+
+    let data;
+    try {
+        data = await response.json();
+    } catch {
+        throw new Error('Cost estimate returned invalid JSON.');
+    }
+
+    if (typeof data?.cost !== 'number' || !Number.isFinite(data.cost) || data.cost < 0) {
+        throw new Error('Cost estimate returned an invalid cost.');
+    }
+    if (typeof data.currency !== 'string' || !/^[A-Za-z]{3}$/.test(data.currency.trim())) {
+        throw new Error('Cost estimate returned an invalid currency.');
+    }
+
+    return {
+        cost: data.cost,
+        currency: data.currency.trim().toUpperCase(),
+    };
+}
+
+export async function processRecast(apiKey, params) {
+    const modelInfo = getRecastModelById(params.model);
+    const endpoint = modelInfo?.endpoint || params.model;
     const videoField = modelInfo?.videoField || 'video_url';
     const payload = { [videoField]: params.video_url };
     if (modelInfo?.imageField && params.image_url) {
@@ -152,6 +271,12 @@ export async function processV2V(apiKey, params) {
     }
     if (modelInfo?.hasPrompt && params.prompt) {
         payload.prompt = params.prompt;
+    }
+    if (params.aspect_ratio) {
+        payload.aspect_ratio = params.aspect_ratio;
+    }
+    if (params.character_orientation) {
+        payload.character_orientation = params.character_orientation;
     }
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
 }
@@ -169,6 +294,20 @@ export async function processLipSync(apiKey, params) {
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
 }
 
+export async function generateAudio(apiKey, params) {
+    const modelId = params._modelId || params.model;
+    const modelInfo = getAudioModelById(modelId);
+    const endpoint = modelInfo?.endpoint || modelId;
+    const payload = {};
+    const skipKeys = ['_modelId', 'onRequestId'];
+    for (const key in params) {
+        if (!skipKeys.includes(key) && params[key] !== undefined && params[key] !== null) {
+            payload[key] = params[key];
+        }
+    }
+    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+}
+
 export function uploadFile(apiKey, file, onProgress) {
     return new Promise((resolve, reject) => {
         const url = `${BASE_URL}/api/v1/upload_file`;
@@ -178,11 +317,15 @@ export function uploadFile(apiKey, file, onProgress) {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', url);
         xhr.setRequestHeader('x-api-key', apiKey);
+        xhr.timeout = FILE_UPLOAD_TIMEOUT_MS;
 
         if (onProgress) {
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
-                    const percentComplete = Math.round((event.loaded / event.total) * 100);
+                    const percentComplete = Math.min(
+                        Math.round((event.loaded / event.total) * 100),
+                        FILE_UPLOAD_PENDING_PROGRESS
+                    );
                     onProgress(percentComplete);
                 }
             };
@@ -196,6 +339,7 @@ export function uploadFile(apiKey, file, onProgress) {
                     if (!fileUrl) {
                         reject(new Error('No URL returned from file upload'));
                     } else {
+                        onProgress?.(100);
                         resolve(fileUrl);
                     }
                 } catch (e) {
@@ -209,11 +353,13 @@ export function uploadFile(apiKey, file, onProgress) {
                 } catch (e) {
                     // fallback to statusText
                 }
+                notifyAuthRequired(xhr.status, detail);
                 reject(new Error(`File upload failed: ${xhr.status} - ${detail}`));
             }
         };
 
         xhr.onerror = () => reject(new Error('Network error during file upload'));
+        xhr.ontimeout = () => reject(new Error('File upload timed out. Please try again.'));
         xhr.send(formData);
     });
 }
@@ -227,6 +373,7 @@ export async function getUserBalance(apiKey) {
     });
     if (!response.ok) {
         const errText = await response.text();
+        notifyAuthRequired(response.status, errText);
         throw new Error(`Failed to fetch balance: ${response.status} - ${errText.slice(0, 100)}`);
     }
     return await response.json();
@@ -336,6 +483,109 @@ export async function getUserConversations(apiKey) {
     const data = await response.json();
     return Array.isArray(data) ? data : [];
 };
+
+// GET /agents/by-slug/{slug} — public agent details (works unauthenticated for
+// published/template agents; x-api-key is sent for consistency but not required).
+export async function getAgentBySlug(apiKey, slug) {
+    const response = await fetch(`${BASE_URL}/agents/by-slug/${slug}`, {
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey
+        }
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to fetch agent: ${response.status} - ${errText.slice(0, 100)}`);
+    }
+    return await response.json();
+}
+
+// GET /agents/by-slug/{slug}/{conversationId} — chat history for one conversation.
+export async function getAgentConversation(apiKey, agentSlug, conversationId) {
+    const response = await fetch(`${BASE_URL}/agents/by-slug/${agentSlug}/${conversationId}`, {
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey
+        }
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to fetch conversation: ${response.status} - ${errText.slice(0, 100)}`);
+    }
+    return await response.json();
+}
+
+// POST /agents/by-slug/{slug}/chat — send a message, returns {request_id, status}
+// to poll via pollAgentChatResult.
+export async function sendAgentChatMessage(apiKey, agentSlug, { message, conversationId, attachments } = {}) {
+    const response = await fetch(`${BASE_URL}/agents/by-slug/${agentSlug}/chat`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey
+        },
+        body: JSON.stringify({
+            message,
+            conversation_id: conversationId || null,
+            attachments: attachments || null,
+            stream: false
+        })
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to send message: ${response.status} - ${errText.slice(0, 100)}`);
+    }
+    return await response.json();
+}
+
+// Polls /api/v1/predictions/{requestId}/result until the agent turn completes.
+// Unlike submitAndPoll's generic media polling, a completed agent-chat result is
+// the full {conversation_id, messages, is_complete, suggestions} envelope, not a
+// media URL — while processing, the endpoint doesn't surface intermediate status
+// text (get_result_url_from_output only returns output_data once COMPLETED), so
+// this just waits until is_complete rather than showing incremental progress.
+export async function pollAgentChatResult(apiKey, requestId, { maxAttempts = 150, interval = 2000 } = {}) {
+    const url = `${BASE_URL}/api/v1/predictions/${requestId}/result`;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, interval));
+        const response = await fetch(url, {
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': apiKey
+            }
+        });
+        if (response.status === 400) {
+            const errBody = await response.json().catch(() => ({}));
+            throw new Error(errBody?.detail?.error || 'Agent failed to respond');
+        }
+        if (!response.ok) {
+            if (attempt === maxAttempts) throw new Error(`Poll failed: ${response.status}`);
+            continue;
+        }
+        const data = await response.json();
+        if (data.is_complete) return data;
+    }
+    throw new Error('Agent response timed out.');
+}
+
+// POST /agents — create a new persona agent (no skill picker in this minimal
+// embedded form; skill_ids defaults to [] server-side, so the agent is created
+// as a plain system-prompt-driven assistant with no extra tool skills attached).
+export async function createAgent(apiKey, payload) {
+    const response = await fetch(`${BASE_URL}/agents`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey
+        },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to create agent: ${response.status} - ${errText.slice(0, 100)}`);
+    }
+    return await response.json();
+}
 
 export async function createWorkflow(apiKey, payload) {
     const response = await fetch(`${BASE_URL}/workflow/create`, {
@@ -643,4 +893,95 @@ export async function getAppInterests(apiKey) {
         throw new Error(`Failed to fetch interests: ${response.status} - ${errText.slice(0, 100)}`);
     }
     return await response.json();
+}
+
+// Paginated past-generations list, scoped server-side to the calling identity
+// (BYOK key or white-label session token) — see GET /api/v1/history.
+export async function getHistory(apiKey, { cursor, limit = 50 } = {}) {
+    const params = new URLSearchParams();
+    if (cursor) params.set('cursor', cursor);
+    if (limit) params.set('limit', String(limit));
+    const response = await fetch(`${BASE_URL}/api/v1/history?${params.toString()}`, {
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey
+        }
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to fetch history: ${response.status} - ${errText.slice(0, 100)}`);
+    }
+    return await response.json();
+}
+
+// DELETE /api/v1/predictions/{requestId}/media — strips input/output media
+// URLs from the request (S3 objects removed) and clears them from the row;
+// used to back the "delete generated item" action against server-backed
+// (backfilled) history lists, since removing an item from local component
+// state alone doesn't touch the server record or its stored media.
+export async function deleteMedia(apiKey, requestId) {
+    const response = await fetch(`${BASE_URL}/api/v1/predictions/${requestId}/media`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey }
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        notifyAuthRequired(response.status, errText);
+        throw new Error(`Failed to delete: ${response.status} - ${errText.slice(0, 100)}`);
+    }
+    return await response.json();
+}
+
+export async function runClipping(apiKey, params) {
+    const payload = {
+        video_url: params.video_url,
+        num_highlights: params.num_highlights || 3,
+        aspect_ratio: params.aspect_ratio || "9:16",
+        return_coordinates_only: !!params.return_coordinates_only
+    };
+    return submitAndPoll("ai-clipping", payload, apiKey, params.onRequestId, 900);
+}
+
+export async function runMotionGraphics(apiKey, params) {
+    const payload = {
+        prompt: params.prompt,
+        aspect_ratio: params.aspect_ratio || "16:9",
+        duration_seconds: params.duration_seconds || 6,
+    };
+    return submitAndPoll("motion-graphics", payload, apiKey, params.onRequestId, 900);
+}
+
+export async function runMotionGraphicsEdit(apiKey, params) {
+    const payload = {
+        request_id: params.request_id,
+        edit_prompt: params.edit_prompt,
+        aspect_ratio: params.aspect_ratio || "16:9",
+        duration_seconds: params.duration_seconds || 6,
+    };
+    return submitAndPoll("motion-graphics-edit", payload, apiKey, params.onRequestId, 900);
+}
+
+export async function upscaleImage(apiKey, { model, image_url, resolution, upscale_factor, onRequestId }) {
+    let endpoint = model;
+    let payload = { image_url };
+    if (model === "seedvr2-image-upscale") {
+        payload.resolution = resolution || "4k";
+    } else if (model === "topaz-image-upscale") {
+        payload.upscale_factor = Number(upscale_factor) || 2;
+    } else if (model === "ai-image-upscaler") {
+        endpoint = "ai-image-upscale";
+    }
+    return submitAndPoll(endpoint, payload, apiKey, onRequestId, 90);
+}
+
+export async function removeBackground(apiKey, { image_url, onRequestId }) {
+    const endpoint = "ai-background-remover";
+    const payload = { image_url };
+    return submitAndPoll(endpoint, payload, apiKey, onRequestId, 90);
+}
+
+export async function expandImage(apiKey, { image_url, onRequestId }) {
+    const endpoint = "ai-image-extension";
+    const payload = { image_url };
+    return submitAndPoll(endpoint, payload, apiKey, onRequestId, 90);
 }
